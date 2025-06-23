@@ -1,4 +1,3 @@
-
 import { useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -7,7 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Search, Users, TrendingUp, Download, Filter, BarChart3, PieChart, UserCheck } from "lucide-react";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart as RechartsPieChart, Cell } from "recharts";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart as RechartsPieChart, Cell, Pie } from "recharts";
 
 const AdminConsole = () => {
   const [searchTerm, setSearchTerm] = useState("");
@@ -278,7 +277,7 @@ const AdminConsole = () => {
                 <ResponsiveContainer width="100%" height={300}>
                   <RechartsPieChart>
                     <Tooltip />
-                    <pie
+                    <Pie
                       data={skillGapData}
                       cx="50%"
                       cy="50%"
@@ -288,7 +287,7 @@ const AdminConsole = () => {
                       {skillGapData.map((entry, index) => (
                         <Cell key={`cell-${index}`} fill={entry.color} />
                       ))}
-                    </pie>
+                    </Pie>
                   </RechartsPieChart>
                 </ResponsiveContainer>
                 <div className="mt-4 space-y-2">
