@@ -1,0 +1,927 @@
+import os
+import json
+import logging
+import asyncio
+import re
+import time
+from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime
+
+from dotenv import load_dotenv
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2 import sql
+
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from langchain_core.prompts import PromptTemplate
+from langchain_core.documents import Document
+from langchain_core.runnables import RunnableSequence
+
+from azure.storage.blob import BlobServiceClient, ContainerClient
+from azure.core.exceptions import ResourceExistsError
+
+import random
+
+# ─────────────────────────────────────────────────────────────
+# LLM CONCURRENCY CONTROL (PRODUCTION SAFE)
+# ─────────────────────────────────────────────────────────────
+LLM_CONCURRENCY_LIMIT = int(os.getenv("LLM_CONCURRENCY_LIMIT", "5"))
+llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY_LIMIT)
+
+# ─────────────────────────────────────────────────────────────
+# ENV & LOGGING
+# ─────────────────────────────────────────────────────────────
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────
+# PROMPT DB MANAGER (UNCHANGED LOGIC, FIXED IMPORTS)
+# ─────────────────────────────────────────────────────────────
+class PostgreSQLPromptManager:
+    """Manages dynamic prompt fetching from PostgreSQL (Prompt DB)"""
+
+    def __init__(self):
+        self.connection_params = {
+            "host": os.getenv("PGHOST_PROMPT"),
+            "port": int(os.getenv("PGPORT_PROMPT", "5432")),
+            "database": os.getenv("PGDATABASE_PROMPT"),
+            "user": os.getenv("PGUSER_PROMPT"),
+            "password": os.getenv("PGPASSWORD_PROMPT"),
+        }
+
+        self.prompt_schema = os.getenv("PG_PROMPT_SCHEMA", "public")
+        self.prompt_table  = os.getenv("PG_PROMPT_TABLE",  "ref_prompt_only")
+
+        self.col_doc_type = os.getenv("PG_PROMPT_COL_DOCUMENT_TYPE", "document_type")
+        self.col_prompt   = os.getenv("PG_PROMPT_COL_PROMPT", "prompt_text")
+        self.col_rules    = os.getenv("PG_PROMPT_COL_EXTRACTION_RULES", "extraction_rules")
+
+    def get_prompt_and_extraction_rules(self, document_type: str) -> Optional[Dict]:
+        """
+        Fetch prompt + extraction_rules for a document_type.
+
+        Returns:
+        {
+          "prompt": <string>,
+          "extraction_rules": { attribute_name: { ... } }
+        }
+        """
+        try:
+            conn = psycopg2.connect(**self.connection_params)
+        except Exception as e:
+            logger.error(f"❌ Prompt DB connection failed: {e}")
+            return None
+
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                query = f"""
+                SELECT {self.col_prompt} AS prompt,
+                       {self.col_rules}  AS extraction_rules
+                FROM {self.prompt_schema}.{self.prompt_table}
+                WHERE LOWER({self.col_doc_type}) = LOWER(%s)
+                LIMIT 1
+                """
+                cur.execute(query, (document_type,))
+                result = cur.fetchone()
+
+                if not result or not result.get("prompt"):
+                    logger.warning(f"⚠️ No prompt found for document_type={document_type}")
+                    return None
+
+                rules = {}
+                raw_rules = result.get("extraction_rules")
+
+                if raw_rules:
+                    try:
+                        if isinstance(raw_rules, str):
+                            rules = json.loads(raw_rules)
+                        elif isinstance(raw_rules, dict):
+                            rules = raw_rules
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"⚠️ Failed to parse extraction_rules JSON: {e}")
+                        rules = {}
+
+                logger.info(
+                    f"✅ Loaded prompt + {len(rules)} extraction rules "
+                    f"for document_type={document_type}"
+                )
+
+                return {
+                    "prompt": result["prompt"],
+                    "extraction_rules": rules
+                }
+
+        except Exception as e:
+            logger.exception("❌ Error fetching prompt and extraction rules")
+            return None
+
+        finally:
+            conn.close()
+
+
+prompt_manager = PostgreSQLPromptManager()
+
+# ─────────────────────────────────────────────────────────────
+# EMBEDDINGS
+# ─────────────────────────────────────────────────────────────
+embeddings = AzureOpenAIEmbeddings(
+    azure_deployment=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_PGVECTOR"),
+    openai_api_key=os.getenv("AZURE_OPENAI_API_KEY_PGVECTOR"),
+    openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION_PGVECTOR"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT_PGVECTOR"),
+)
+
+# ─────────────────────────────────────────────────────────────
+# POSTGRES VECTOR STORE (UNCHANGED LOGIC)
+# ─────────────────────────────────────────────────────────────
+class PostgresVectorStore:
+    def __init__(self, embeddings, reference_id: str):
+        self.embeddings = embeddings
+        self.reference_id = reference_id
+        self.connection_params = {
+            "host": os.getenv("PGHOST_PGVECTOR"),
+            "port": int(os.getenv("PGPORT_PGVECTOR", "5432")),
+            "database": os.getenv("PGDATABASE_PGVECTOR"),
+            "user": os.getenv("PGUSER_PGVECTOR"),
+            "password": os.getenv("PGPASSWORD_PGVECTOR"),
+        }
+
+        self.schema = os.getenv("PG_VECTOR_SCHEMA", "public")
+        self.table = os.getenv("PG_VECTOR_TABLE", "pgvector_store")
+        self.text_col = os.getenv("PG_COL_TEXT", "content")
+        self.embedding_col = os.getenv("PG_COL_EMBEDDING", "embedding")
+        self.ref_col = os.getenv("PG_COL_REFERENCE_ID", "mail_ref_id")
+        self.meta_col = os.getenv("PG_COL_METADATA", "metadata")
+
+    def similarity_search(self, query: str, k: int = 10) -> List[Document]:
+        vec = self.embeddings.embed_query(query)
+        vec_str = "[" + ",".join(f"{x:.8f}" for x in vec) + "]"
+
+        sql_query = f"""
+            SELECT {self.text_col}, {self.meta_col}
+            FROM {self.schema}.{self.table}
+            WHERE {self.ref_col} = %s
+            ORDER BY {self.embedding_col} <=> %s::vector
+            LIMIT %s
+        """
+
+        with psycopg2.connect(**self.connection_params) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_query, (self.reference_id, vec_str, k))
+                rows = cur.fetchall()
+
+        return [
+            Document(page_content=row[0], metadata=row[1] or {})
+            for row in rows
+        ]
+# ─────────────────────────────────────────────────────────────
+# Grouping helpers 
+# ─────────────────────────────────────────────────────────────
+
+def _extract_json_object(text: str) -> str:
+    cleaned = re.sub(r"```(?:json)?|```", "", text).strip()
+    try:
+        json.loads(cleaned)
+        return cleaned
+    except Exception:
+        pass
+
+    start = cleaned.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found.")
+
+    depth = 0
+    for i in range(start, len(cleaned)):
+        if cleaned[i] == "{":
+            depth += 1
+        elif cleaned[i] == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = cleaned[start:i + 1]
+                json.loads(candidate)
+                return candidate
+
+    raise ValueError("Unbalanced JSON in response.")
+
+
+def _validate_and_repair_grouping(
+    input_attrs: Dict[str, str],
+    grouped: Dict[str, Dict[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    input_keys = set(input_attrs.keys())
+    seen = set()
+    repaired = {}
+
+    for category, fields in grouped.items():
+        if not isinstance(fields, dict):
+            continue
+
+        valid = {}
+        for k, v in fields.items():
+            if k in input_keys and k not in seen:
+                valid[k] = v
+                seen.add(k)
+
+        if valid:
+            repaired[category] = valid
+
+    missing = input_keys - seen
+    if missing:
+        repaired.setdefault("Other", {})
+        for k in missing:
+            repaired["Other"][k] = input_attrs[k]
+
+    return repaired
+
+# ─────────────────────────────────────────────────────────────
+# Prompt template safety helpers
+# ─────────────────────────────────────────────────────────────
+
+def escape_non_template_vars(template: str, allowed_vars: set[str]) -> str:
+    """
+    Make the prompt LangChain-safe by:
+    1. Escaping ALL braces
+    2. Re-enabling only allowed template variables
+    """
+
+    # Step 1: Escape EVERYTHING
+    escaped = template.replace("{", "{{").replace("}", "}}")
+
+    # Step 2: Restore allowed variables
+    for var in allowed_vars:
+        escaped = escaped.replace(
+            "{{" + var + "}}",
+            "{" + var + "}"
+        )
+
+    return escaped
+# ─────────────────────────────────────────────────────────────
+# MAIN RETRIEVAL PIPELINE
+# ─────────────────────────────────────────────────────────────
+
+def group_attributes_by_category(attributes_dict: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Robust grouping with:
+    - LLM-based semantic grouping
+    - Retry/backoff
+    - Strict JSON enforcement
+    - Full coverage validation
+    - Deterministic fallback
+    """
+
+    llm = AzureChatOpenAI(
+        openai_api_key=os.getenv("AZURE_OPENAI_API_KEY_PGVECTOR"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT_PGVECTOR"),
+        openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION_PGVECTOR"),
+        deployment_name=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_PGVECTOR"),
+        temperature=0,
+        top_p=1,
+    )
+
+#     grouping_prompt = PromptTemplate(
+#         input_variables=["attributes_json"],
+#         template="""You are a JSON data formatter for insurance underwriting documents.
+
+# Group the following extracted attributes logically based on insurance context.
+
+# RULES:
+# - Each attribute must appear exactly once
+# - Preserve exact attribute names and values
+# - Create meaningful insurance categories
+# - If unsure, place in "Other"
+# - DO NOT return explanations
+# - Return STRICT JSON ONLY
+
+# INPUT:
+# {attributes_json}
+
+# OUTPUT:
+# {{ 
+#   "Category Name": {{
+#     "attribute": "value"
+#   }}
+# }}
+# """
+
+    grouping_prompt = PromptTemplate(
+    input_variables=["attributes_json"],
+    template="""You are an insurance underwriting assistant.
+
+Group the following extracted attributes into logical insurance categories.
+
+RULES:
+- Do NOT alter attribute names or values
+- Each attribute must appear exactly once
+- Create meaningful insurance categories
+- Use "Other" if unsure
+- Return STRICT JSON ONLY
+
+INPUT:
+{attributes_json}
+
+OUTPUT:
+{{ 
+  "Category Name": {{
+    "attribute": "value"
+  }}
+}}
+"""
+)
+
+
+    chain = grouping_prompt | llm
+
+    max_attempts = 3
+    backoff = 1.5
+    attributes_json = json.dumps(attributes_dict, ensure_ascii=False)
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            raw = chain.invoke({"attributes_json": attributes_json})
+            text = raw.content if hasattr(raw, "content") else str(raw)
+            json_text = _extract_json_object(text)
+            candidate = json.loads(json_text)
+
+            cleaned = _validate_and_repair_grouping(attributes_dict, candidate)
+            return cleaned
+
+        except Exception as e:
+            logger.warning(f"[grouping] attempt {attempt} failed: {e}")
+            if attempt < max_attempts:
+                time.sleep(backoff * attempt)
+
+    logger.warning("[grouping] falling back to deterministic grouping")
+    return {"Other": attributes_dict}
+
+# ────────────────────────────────────────────────────────────────
+# Async wrapper for grouping (REQUIRED)
+# ────────────────────────────────────────────────────────────────
+
+async def group_attributes_by_category_async(attributes_dict: Dict[str, str]) -> Dict[str, Any]:
+    return await asyncio.to_thread(group_attributes_by_category, attributes_dict)
+
+# ─────────────────────────────────────────────────────────────
+#  Azure Blob upload helper 
+# ─────────────────────────────────────────────────────────────
+def upload_json_to_blob(
+    *,
+    container_name: str,
+    file_name: str,
+    data: dict
+) -> str:
+    """
+    Upload JSON data to Azure Blob Storage and return the blob URL.
+
+    Requires:
+      - AZURE_STORAGE_CONNECTION_STRING
+      - OUTPUT_BLOB_CONTAINER (passed in as container_name)
+
+    Auto-creates container if it does not exist.
+    """
+
+    from azure.storage.blob import BlobServiceClient
+    from azure.core.exceptions import ResourceExistsError
+
+    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING_PGVECTOR")
+    if not connection_string:
+        raise RuntimeError(
+            "AZURE_STORAGE_CONNECTION_STRING is not set in .env"
+        )
+
+    if not container_name:
+        raise RuntimeError(
+            "OUTPUT_BLOB_CONTAINER is not set or empty"
+        )
+
+    # Initialize client
+    blob_service_client = BlobServiceClient.from_connection_string(
+        connection_string
+    )
+
+    container_client = blob_service_client.get_container_client(
+        container_name
+    )
+
+    # Create container if missing
+    try:
+        container_client.create_container()
+        logger.info(f"☁️ Created blob container: {container_name}")
+    except ResourceExistsError:
+        pass  # Container already exists
+
+    blob_client = container_client.get_blob_client(file_name)
+
+    payload = json.dumps(
+        data,
+        indent=2,
+        ensure_ascii=False
+    ).encode("utf-8")
+
+    # Upload JSON
+    blob_client.upload_blob(
+        payload,
+        overwrite=True,
+        content_type="application/json"
+    )
+
+    logger.info(f"☁️ Uploaded output JSON to blob: {blob_client.url}")
+
+    return blob_client.url
+
+
+
+async def invoke_llm_with_retry(
+    chain,
+    payload: Dict[str, Any],
+    *,
+    max_retries: int = 5,
+    base_delay: float = 1.0,
+):
+    logger.info("🧠 LLM CALL MADE")
+    """
+    Invoke LLM with retry + exponential backoff
+    Retries ONLY on Azure OpenAI rate limiting (429)
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with llm_semaphore:
+                return await asyncio.to_thread(
+                    chain.invoke,
+                    payload
+                )
+
+        except Exception as e:
+            msg = str(e).lower()
+
+            if "429" in msg or "too_many_requests" in msg:
+                if attempt == max_retries:
+                    raise
+
+                backoff = base_delay * (2 ** (attempt - 1))
+                backoff += random.uniform(0, 0.5)
+
+                logger.warning(
+                    f"🚦 OpenAI throttled (attempt {attempt}/{max_retries}), "
+                    f"retrying in {backoff:.2f}s"
+                )
+                await asyncio.sleep(backoff)
+            else:
+                # Non-rate-limit errors should fail fast
+                raise
+
+# ────────────────────────────────────────────────────────────
+# For Batch PGVector retrieval WITHOUT LLM calls (for debugging + testing)
+#───────────────────────────────────────────────────────────
+async def build_attribute_contexts(
+    vectordb: PostgresVectorStore,
+    extraction_rules: Dict[str, Any]
+) -> Dict[str, Dict[str, str]]:
+    """
+    Concurrent PGVector retrieval for ALL attributes.
+    No LLM calls here.
+    """
+
+    async def fetch_context(attr: str, rule: Dict[str, Any]):
+        k = int(rule.get("k", 13))
+        instruction = rule.get("description", "")
+
+        docs = await asyncio.to_thread(
+            vectordb.similarity_search,
+            attr,
+            k
+        )
+
+        if not docs:
+            return None
+
+        return attr, {
+            "instruction": instruction,
+            "context": "\n".join(d.page_content for d in docs)
+        }
+
+    tasks = [
+        fetch_context(attr, rule)
+        for attr, rule in extraction_rules.items()
+    ]
+
+    results = await asyncio.gather(*tasks)
+
+    # Filter out None results
+    return {
+        attr: payload
+        for item in results
+        if item is not None
+        for attr, payload in [item]
+    }
+
+    logger.info(f"🔍 PGVector search for attribute: {attr}")
+
+batched_extraction_prompt = PromptTemplate(
+    input_variables=["attributes_bundle"],
+    template="""
+You are an insurance underwriting extraction engine.
+
+For each attribute:
+- Use ONLY the provided context
+- Follow the instruction
+- Do NOT hallucinate
+- Return null if not found
+
+INPUT (JSON):
+{attributes_bundle}
+
+OUTPUT (STRICT JSON ONLY):
+{
+  "attribute_name": value | null
+}
+"""
+)
+
+
+async def extract_all_attributes_batched(
+    llm: AzureChatOpenAI,
+    attribute_contexts: Dict[str, Dict[str, str]]
+) -> Dict[str, Any]:
+    """
+    ONE LLM call to extract ALL attributes.
+    """
+
+    if not attribute_contexts:
+        return {}
+
+    chain = batched_extraction_prompt | llm
+
+    raw = await invoke_llm_with_retry(
+        chain,
+        {
+            "attributes_bundle": json.dumps(
+                attribute_contexts,
+                ensure_ascii=False
+            )
+        }
+    )
+
+    text = raw.content if hasattr(raw, "content") else str(raw)
+    json_text = _extract_json_object(text)
+    parsed = json.loads(json_text)
+
+    return {
+        attr: value
+        for attr, value in parsed.items()
+        if value is not None
+    }
+
+
+# async def process_retrieval_pg(reference_id: str, document_type: str) -> Dict[str, Any]:
+#     try:
+#         # ──────────────────────────────────────
+#         # 1. Load prompt + extraction rules
+#         # ──────────────────────────────────────
+#         db_data = prompt_manager.get_prompt_and_extraction_rules(document_type)
+#         if not db_data:
+#             raise RuntimeError(f"No prompt data found for document_type={document_type}")
+
+#         raw_prompt = db_data["prompt"]
+#         extraction_rules = db_data.get("extraction_rules", {})
+#         if not extraction_rules:
+#             raise RuntimeError("No extraction rules found")
+
+#         # ──────────────────────────────────────
+#         # 2. Escape ALL non-template braces
+#         #    (Only allow context/attribute/instruction)
+#         # ──────────────────────────────────────
+#         prompt_template = escape_non_template_vars(
+#             raw_prompt,
+#             allowed_vars={"context", "attribute", "instruction"}
+#         )
+
+#         # ✅ Critical debug log (can downgrade to DEBUG later)
+#         logger.info("🧠 Final Prompt Template:\n" + prompt_template)
+
+#         # ──────────────────────────────────────
+#         # 3. Build PromptTemplate + LLM
+#         # ──────────────────────────────────────
+#         attribute_prompt = PromptTemplate(
+#             input_variables=["context", "attribute", "instruction"],
+#             template=prompt_template
+#         )
+
+#         llm = AzureChatOpenAI(
+#             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT_PGVECTOR"),
+#             openai_api_key=os.getenv("AZURE_OPENAI_API_KEY_PGVECTOR"),
+#             openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION_PGVECTOR"),
+#             deployment_name=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_PGVECTOR"),
+#             temperature=0,
+#         )
+
+#         chain = attribute_prompt | llm
+
+#         vectordb = PostgresVectorStore(
+#             embeddings=embeddings,
+#             reference_id=reference_id
+#         )
+
+#         # ──────────────────────────────────────
+#         # 4. Attribute extraction worker
+#         # ──────────────────────────────────────
+#         async def extract_one(attr: str, rule: Dict[str, Any]) -> Tuple[str, Optional[Any]]:
+#             try:
+#                 k = int(rule.get("k", 13))
+#                 instruction = rule.get("description", "")
+
+#                 docs = await asyncio.to_thread(
+#                     vectordb.similarity_search,
+#                     attr,
+#                     k
+#                 )
+
+#                 if not docs:
+#                     return attr, None
+
+#                 context = "\n".join(d.page_content for d in docs)
+
+#                 # raw = await asyncio.to_thread(
+#                 #     chain.invoke,
+#                 #     {
+#                 #         "context": context,
+#                 #         "attribute": attr,
+#                 #         "instruction": instruction
+#                 #     }
+#                 # )
+
+#                 raw = await invoke_llm_with_retry(
+#                     chain,
+#                     {
+#                         "context": context,
+#                         "attribute": attr,
+#                         "instruction": instruction
+#                     }
+#                 )
+
+#                 text = raw.content if hasattr(raw, "content") else str(raw)
+#                 cleaned = re.sub(r"```(?:json)?|```", "", text).strip()
+
+#                 parsed = json.loads(cleaned)
+#                 return attr, parsed.get("amount")
+
+#             # except Exception as e:
+#             #     logger.warning(f"⚠️ Failed to extract {attr}: {e}")
+#             #     return attr, None
+
+#             except Exception as e:
+#                 error_message = str(e)
+
+#                 if "429" in error_message or "too_many_requests" in error_message.lower():
+#                     logger.error(
+#                         f"🚦 Rate limited while extracting '{attr}'. "
+#                         f"Consider lowering LLM_CONCURRENCY_LIMIT or increasing Azure quota."
+#                     )
+#                 else:
+#                     logger.warning(f"⚠️ Failed to extract '{attr}': {error_message}")
+
+#                 return attr, None
+
+
+#         # ──────────────────────────────────────
+#         # 5. Run ALL extractions concurrently
+#         # ──────────────────────────────────────
+#         results = await asyncio.gather(
+#             *(extract_one(attr, rule) for attr, rule in extraction_rules.items())
+#         )
+
+#         extracted = {
+#             attr: value
+#             for attr, value in results
+#             if value is not None
+#         }
+
+#         if not extracted:
+#             return {
+#                 "extracted": False,
+#                 "reference_id": reference_id,
+#                 "document_type": document_type,
+#                 "error_message": "No attributes were extracted"
+#             }
+
+#         # ──────────────────────────────────────
+#         # 6. Group attributes (semantic categories)
+#         # ──────────────────────────────────────
+#         grouped = await group_attributes_by_category_async(extracted)
+
+#         # ──────────────────────────────────────
+#         # 7. Save locally + upload to Blob
+#         # ──────────────────────────────────────
+#         output_dir = os.getenv("OUTPUT_DIR", "./data/extraction_outputs")
+#         os.makedirs(output_dir, exist_ok=True)
+
+#         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+#         filename = f"{reference_id}_{document_type}_{timestamp}.json"
+
+#         local_path = os.path.join(output_dir, filename)
+#         with open(local_path, "w", encoding="utf-8") as f:
+#             json.dump(grouped, f, indent=2, ensure_ascii=False)
+
+#         blob_url = upload_json_to_blob(
+#             container_name=os.getenv("OUTPUT_BLOB_CONTAINER", "extraction-results"),
+#             file_name=filename,
+#             data=grouped
+#         )
+
+#         # ──────────────────────────────────────
+#         # 8. Final API response
+#         # ──────────────────────────────────────
+#         return {
+#             "extracted": True,
+#             "reference_id": reference_id,
+#             "document_type": document_type,
+#             "output_blob_url": blob_url
+#         }
+
+#     except Exception as e:
+#         logger.exception("❌ Extraction failed")
+#         return {
+#             "extracted": False,
+#             "reference_id": reference_id,
+#             "document_type": document_type,
+#             "error_message": str(e)
+#         }
+
+
+
+## new process retrieval with batched extraction (for testing/debugging)
+async def process_retrieval_pg(reference_id: str, document_type: str) -> Dict[str, Any]:
+    try:
+        # ──────────────────────────────────────
+        # 1. Load prompt + extraction rules
+        # ──────────────────────────────────────
+        db_data = prompt_manager.get_prompt_and_extraction_rules(document_type)
+        if not db_data:
+            raise RuntimeError(
+                f"No prompt data found for document_type={document_type}"
+            )
+
+        raw_prompt = db_data["prompt"]
+        extraction_rules = db_data.get("extraction_rules", {})
+        if not extraction_rules:
+            raise RuntimeError("No extraction rules found")
+
+        # ──────────────────────────────────────
+        # 2. Escape non-template braces
+        #    (only allow the batching variable)
+        # ──────────────────────────────────────
+        prompt_template = escape_non_template_vars(
+            raw_prompt,
+            allowed_vars={"attributes_bundle"}
+        )
+
+        logger.info("🧠 Final Batched Prompt Loaded")
+
+        batched_prompt = PromptTemplate(
+            input_variables=["attributes_bundle"],
+            template=prompt_template
+        )
+
+        # ──────────────────────────────────────
+        # 3. Build LLM + VectorDB
+        # ──────────────────────────────────────
+        llm = AzureChatOpenAI(
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT_PGVECTOR"),
+            openai_api_key=os.getenv("AZURE_OPENAI_API_KEY_PGVECTOR"),
+            openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION_PGVECTOR"),
+            deployment_name=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_PGVECTOR"),
+            temperature=0,
+        )
+
+        vectordb = PostgresVectorStore(
+            embeddings=embeddings,
+            reference_id=reference_id
+        )
+
+        # ──────────────────────────────────────
+        # 4. Concurrent PGVector retrieval
+        # ──────────────────────────────────────
+        async def fetch_context(attr: str, rule: Dict[str, Any]):
+            k = int(rule.get("k", 13))
+            instruction = rule.get("description", "")
+
+            docs = await asyncio.to_thread(
+                vectordb.similarity_search,
+                attr,
+                k
+            )
+
+            if not docs:
+                return None
+
+            return attr, {
+                "instruction": instruction,
+                "context": "\n".join(d.page_content for d in docs)
+            }
+
+        tasks = [
+            fetch_context(attr, rule)
+            for attr, rule in extraction_rules.items()
+        ]
+
+        results = await asyncio.gather(*tasks)
+
+        attribute_contexts = {
+            attr: payload
+            for item in results
+            if item is not None
+            for attr, payload in [item]
+        }
+
+        if not attribute_contexts:
+            return {
+                "extracted": False,
+                "reference_id": reference_id,
+                "document_type": document_type,
+                "error_message": "No relevant context found"
+            }
+
+        
+        # ✅ ADD THIS LOG RIGHT HERE
+        logger.info(
+            "🧾 FINAL PROMPT INPUT (attributes_bundle):\n%s",
+            json.dumps(attribute_contexts, indent=2, ensure_ascii=False)
+        )
+
+
+        # ──────────────────────────────────────
+        # 5. SINGLE batched LLM call
+        # ──────────────────────────────────────
+        chain = batched_prompt | llm
+
+        raw = await invoke_llm_with_retry(
+            chain,
+            {
+                "attributes_bundle": json.dumps(
+                    attribute_contexts,
+                    ensure_ascii=False
+                )
+            }
+        )
+
+        text = raw.content if hasattr(raw, "content") else str(raw)
+        json_text = _extract_json_object(text)
+        parsed = json.loads(json_text)
+
+        extracted = {
+            k: v for k, v in parsed.items() if v is not None
+        }
+
+        if not extracted:
+            return {
+                "extracted": False,
+                "reference_id": reference_id,
+                "document_type": document_type,
+                "error_message": "LLM returned no extracted attributes"
+            }
+
+        # ──────────────────────────────────────
+        # 6. Group attributes (unchanged)
+        # ──────────────────────────────────────
+        grouped = await group_attributes_by_category_async(extracted)
+
+        # ──────────────────────────────────────
+        # 7. Save + upload
+        # ──────────────────────────────────────
+        output_dir = os.getenv("OUTPUT_DIR", "./data/extraction_outputs")
+        os.makedirs(output_dir, exist_ok=True)
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"{reference_id}_{document_type}_{timestamp}.json"
+
+        local_path = os.path.join(output_dir, filename)
+        with open(local_path, "w", encoding="utf-8") as f:
+            json.dump(grouped, f, indent=2, ensure_ascii=False)
+
+        blob_url = upload_json_to_blob(
+            container_name=os.getenv("OUTPUT_BLOB_CONTAINER", "extraction-results"),
+            file_name=filename,
+            data=grouped
+        )
+
+        # ──────────────────────────────────────
+        # 8. Final response
+        # ──────────────────────────────────────
+        return {
+            "extracted": True,
+            "reference_id": reference_id,
+            "document_type": document_type,
+            "output_blob_url": blob_url
+        }
+
+    except Exception as e:
+        logger.exception("❌ Extraction failed")
+        return {
+            "extracted": False,
+            "reference_id": reference_id,
+            "document_type": document_type,
+            "error_message": str(e)
+        }
+
+
+
