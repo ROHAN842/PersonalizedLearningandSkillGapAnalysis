@@ -1,0 +1,484 @@
+import os
+import json
+import hashlib
+import argparse
+from datetime import datetime
+from typing import Optional, Tuple
+from urllib.parse import urlparse, unquote
+
+from dotenv import load_dotenv
+import psycopg2
+from psycopg2.extras import execute_values
+from azure.storage.blob import BlobClient
+from openai import AzureOpenAI
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+import uvicorn
+
+# ✅ Retrieval pipeline (USES PROMPT DB INTERNALLY)
+from pgvector_retrieval_mcp.postgres_retriever import process_retrieval_pg
+
+# for inserting data in attachment info table
+from pgvector_retrieval_mcp.attachement_info_repo import insert_attachment_info
+
+# ─────────────────────────────────────────────
+# ENV
+# ─────────────────────────────────────────────
+load_dotenv()
+
+# code for skipping duplicates
+###this means basically if we are doing some changes in pdf and using the same refernce id it will not get ingest in vector db 
+###as the refernce id is same. so it will skip ingesting and give the retriving from previous saved embeddings
+def normalize_text(text: str) -> str:
+    """Normalize whitespace so same text always hashes the same"""
+    return " ".join(text.strip().split())
+
+
+def compute_content_hash(text: str) -> str:
+    """
+    Hash used for deduplication per reference_id.
+    """
+    return hashlib.sha256(normalize_text(text).encode("utf-8")).hexdigest()
+
+# ── CHUNK DB (pgvector)
+DATABASE_URL = os.getenv("DATABASE_URL")
+DB_SCHEMA = os.getenv("DB_SCHEMA", "public")
+DB_TABLE = os.getenv("DB_TABLE", "pgvector_store")
+
+# ── PROMPT DB CONFIG (used inside postgres_retriever.py – NOT HERE)
+# PG_PROMPT_SCHEMA
+# PG_PROMPT_TABLE
+# PG_PROMPT_COL_DOCUMENT_TYPE
+# PG_PROMPT_COL_PROMPT
+
+# ── Azure Blob
+AZURE_BLOB_ACCOUNT_URL = os.getenv("AZURE_BLOB_ACCOUNT_URL_PGVECTOR")
+AZURE_BLOB_CONTAINER = os.getenv("AZURE_BLOB_CONTAINER_PGVECTOR")
+
+# ── Azure OpenAI (Embeddings only here)
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT_PGVECTOR")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY_PGVECTOR")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION_PGVECTOR")
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_PGVECTOR")
+
+# ── Processing
+EMBED_DIM = 3072
+CHUNK_CHARS = int(os.getenv("CHUNK_CHARS", "800"))
+OVERLAP_CHARS = int(os.getenv("OVERLAP_CHARS", "100"))
+OUTPUT_DIR = os.getenv("OUTPUT_DIR")
+
+
+# ─────────────────────────────────────────────
+# CHUNK DB HELPERS
+# ─────────────────────────────────────────────
+def get_chunk_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+
+# def ensure_pgvector_table(conn):
+#     with conn.cursor() as cur:
+#         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+#         cur.execute(f"""
+#         CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.{DB_TABLE} (
+#             id BIGSERIAL PRIMARY KEY,
+#             doc_id TEXT NOT NULL,
+#             source TEXT NOT NULL,
+#             page INT NOT NULL,
+#             chunk_index INT NOT NULL,
+#             content TEXT NOT NULL,
+#             embedding VECTOR({EMBED_DIM}) NOT NULL,
+#             metadata JSONB,
+#             mail_ref_id TEXT,
+#             attachment_id TEXT,
+#             UNIQUE (mail_ref_id, attachment_id, page, chunk_index)
+#         );
+#         """)
+#     conn.commit()
+
+### code for skipping duplicates 
+def ensure_pgvector_table(conn):
+    with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS {DB_SCHEMA}.{DB_TABLE} (
+            id BIGSERIAL PRIMARY KEY,
+            doc_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            page INT NOT NULL,
+            chunk_index INT NOT NULL,
+            content TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            embedding VECTOR({EMBED_DIM}) NOT NULL,
+            metadata JSONB,
+            mail_ref_id TEXT,
+            attachment_id TEXT,
+
+            -- ✅ Dedup ONLY per reference_id
+            UNIQUE (mail_ref_id, content_hash),
+
+            -- ✅ Keep old safety constraint
+            UNIQUE (mail_ref_id, attachment_id, page, chunk_index)
+        );
+        """)
+    conn.commit()
+
+# for skipping duplicates 
+def chunk_exists(conn, reference_id: str, content_hash: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT 1
+            FROM {DB_SCHEMA}.{DB_TABLE}
+            WHERE mail_ref_id = %s
+              AND content_hash = %s
+            LIMIT 1
+            """,
+            (reference_id, content_hash),
+        )
+        return cur.fetchone() is not None
+
+# def already_ingested(reference_id: str, attachment_id: str) -> bool:
+#     with get_chunk_conn() as conn, conn.cursor() as cur:
+#         cur.execute(
+#             f"""
+#             SELECT 1 FROM {DB_SCHEMA}.{DB_TABLE}
+#             WHERE mail_ref_id=%s AND attachment_id=%s
+#             LIMIT 1
+#             """,
+#             (reference_id, attachment_id),
+#         )
+#         return cur.fetchone() is not None
+
+def already_ingested(reference_id: str, attachment_id: str) -> bool:
+    with get_chunk_conn() as conn:
+        # ✅ Ensure table exists BEFORE querying
+        ensure_pgvector_table(conn)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT 1
+                FROM {DB_SCHEMA}.{DB_TABLE}
+                WHERE mail_ref_id=%s AND attachment_id=%s
+                LIMIT 1
+                """,
+                (reference_id, attachment_id)
+            )
+            return cur.fetchone() is not None
+
+
+# ─────────────────────────────────────────────
+# AZURE BLOB
+# ─────────────────────────────────────────────
+def split_blob_url(blob_url: str) -> Tuple[str, str, str]:
+    parsed = urlparse(blob_url)
+    account_url = f"{parsed.scheme}://{parsed.netloc}"
+    parts = parsed.path.lstrip("/").split("/", 1)
+    container = parts[0]
+    blob_name = unquote(parts[1]) if len(parts) > 1 else ""
+    return account_url, container, blob_name
+
+
+def resolve_blob(blob_url: Optional[str], blob_name: Optional[str]):
+    if blob_url:
+        return split_blob_url(blob_url)
+
+    if not (AZURE_BLOB_ACCOUNT_URL and AZURE_BLOB_CONTAINER and blob_name):
+        raise ValueError("Provide blob_url OR blob_name with AZURE_BLOB_* env vars")
+
+    return AZURE_BLOB_ACCOUNT_URL, AZURE_BLOB_CONTAINER, blob_name
+
+
+# def read_txt_from_blob(account_url: str, container: str, blob_name: str) -> str:
+#     bc = BlobClient(account_url, container, blob_name)
+#     return bc.download_blob().readall().decode("utf-8")
+
+
+def read_txt_from_blob(account_url: str, container: str, blob_name: str) -> str:
+    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING_PGVECTOR")
+    if not conn_str:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING not set")
+
+    bc = BlobClient.from_connection_string(
+        conn_str=conn_str,
+        container_name=container,
+        blob_name=blob_name
+    )
+    return bc.download_blob().readall().decode("utf-8")
+
+
+# ─────────────────────────────────────────────
+# TEXT → CHUNKS
+# ─────────────────────────────────────────────
+def chunk_text(text: str):
+    clean = " ".join(text.split())
+    chunks = []
+    start, idx = 0, 0
+
+    while start < len(clean):
+        end = min(start + CHUNK_CHARS, len(clean))
+        part = clean[start:end]
+        if part.strip():
+            chunks.append((1, idx, part))
+            idx += 1
+        start = end - OVERLAP_CHARS if end < len(clean) else end
+
+    return chunks
+
+
+# ─────────────────────────────────────────────
+# AZURE OPENAI EMBEDDINGS
+# ─────────────────────────────────────────────
+def aoai_client():
+    return AzureOpenAI(
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=AZURE_OPENAI_API_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
+    )
+
+
+def embed_texts(texts):
+    client = aoai_client()
+    resp = client.embeddings.create(
+        model=AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+        input=texts,
+        dimensions=EMBED_DIM,
+    )
+    return [d.embedding for d in resp.data]
+
+
+def vec(v):
+    return "[" + ",".join(f"{x:.8f}" for x in v) + "]"
+
+
+# ─────────────────────────────────────────────
+# INGESTION (CHUNK DB)
+# ─────────────────────────────────────────────
+# def ingest(reference_id: str, account_url: str, container: str, blob_name: str):
+#     attachment_id = blob_name
+
+#     if already_ingested(reference_id, attachment_id):
+#         return "already_ingested"
+
+#     text = read_txt_from_blob(account_url, container, blob_name)
+#     chunks = chunk_text(text)
+#     embeddings = embed_texts([c[2] for c in chunks])
+
+#     doc_id = hashlib.sha1(f"{container}/{blob_name}".encode()).hexdigest()
+
+#     with get_chunk_conn() as conn:
+#         ensure_pgvector_table(conn)
+#         with conn.cursor() as cur:
+#             execute_values(
+#                 cur,
+#                 f"""
+#                 INSERT INTO {DB_SCHEMA}.{DB_TABLE}
+#                 (doc_id, source, page, chunk_index, content, embedding, metadata, mail_ref_id, attachment_id)
+#                 VALUES %s
+#                 ON CONFLICT (mail_ref_id, attachment_id, page, chunk_index)
+#                 DO UPDATE SET content=EXCLUDED.content, embedding=EXCLUDED.embedding
+#                 """,
+#                 [
+#                     (
+#                         doc_id,
+#                         f"{container}/{blob_name}",
+#                         page,
+#                         idx,
+#                         text,
+#                         vec(emb),
+#                         json.dumps({"chunk": idx}),
+#                         reference_id,
+#                         attachment_id,
+#                     )
+#                     for (page, idx, text), emb in zip(chunks, embeddings)
+#                 ],
+#             )
+#         conn.commit()
+
+#     return "ingested"
+
+
+#### code for skipping duplicates in ingestion
+def ingest(reference_id: str, account_url: str, container: str, blob_name: str):
+    attachment_id = blob_name
+
+    text = read_txt_from_blob(account_url, container, blob_name)
+    chunks = chunk_text(text)
+    embeddings = embed_texts([c[2] for c in chunks])
+
+    doc_id = hashlib.sha1(f"{container}/{blob_name}".encode()).hexdigest()
+
+    with get_chunk_conn() as conn:
+        ensure_pgvector_table(conn)
+
+        rows_to_insert = []
+
+        for (page, idx, chunk_content), emb in zip(chunks, embeddings):
+            content_hash = compute_content_hash(chunk_content)
+
+            # ✅ SKIP only if SAME reference_id + SAME content
+            if chunk_exists(conn, reference_id, content_hash):
+                continue
+
+            rows_to_insert.append(
+                (
+                    doc_id,
+                    f"{container}/{blob_name}",
+                    page,
+                    idx,
+                    chunk_content,
+                    content_hash,
+                    vec(emb),
+                    json.dumps({"chunk": idx}),
+                    reference_id,
+                    attachment_id,
+                )
+            )
+
+        if not rows_to_insert:
+            return "no_new_chunks"
+
+        with conn.cursor() as cur:
+            # execute_values(
+            #     cur,
+            #     f"""
+            #     INSERT INTO {DB_SCHEMA}.{DB_TABLE}
+            #     (
+            #         doc_id, source, page, chunk_index,
+            #         content, content_hash, embedding,
+            #         metadata, mail_ref_id, attachment_id
+            #     )
+            #     VALUES %s
+            #     ON CONFLICT (mail_ref_id, content_hash)
+            #     DO NOTHING
+            #     """,
+            #     rows_to_insert,
+            # )
+
+            ### skipping duplicates
+            execute_values(
+                cur,
+                f"""
+                INSERT INTO {DB_SCHEMA}.{DB_TABLE}
+                (
+                    doc_id, source, page, chunk_index,
+                    content, content_hash, embedding,
+                    metadata, mail_ref_id, attachment_id
+                )
+                VALUES %s
+                ON CONFLICT DO NOTHING
+                """,
+                rows_to_insert,
+            )
+        conn.commit()
+
+    return "ingested"
+
+# ─────────────────────────────────────────────
+# OUTPUT STORAGE
+# ─────────────────────────────────────────────
+# def save_output(reference_id, document_type, output):
+#     os.makedirs(OUTPUT_DIR, exist_ok=True)
+#     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+#     path = f"{OUTPUT_DIR}/{reference_id}_{document_type}_{ts}.json"
+#     with open(path, "w", encoding="utf-8") as f:
+#         json.dump(output, f, indent=2)
+#     return path
+
+
+# ─────────────────────────────────────────────
+# MCP PIPELINE
+# ─────────────────────────────────────────────
+# async def run_mcp(reference_id, document_type, blob_url, blob_name):
+#     try:
+#         account, container, blob = resolve_blob(blob_url, blob_name)
+#         ingestion_status = ingest(reference_id, account, container, blob)
+
+#         extraction = await process_retrieval_pg(
+#             reference_id=reference_id,
+#             document_type=document_type,
+#         )
+
+#         if not extraction.get("is_extracted"):
+#             return {
+#                 "is_extracted": False,
+#                 "error": extraction.get("error"),
+#                 "metadata": extraction.get("metadata")
+#                 # "output": None
+#             }
+#             # raise RuntimeError(extraction["metadata"]["error_message"])
+
+#         output_path = save_output(reference_id, document_type, extraction["output"])
+
+#         return {
+#             "is_extracted": True,
+#             "error": None,
+#             "metadata":extraction.get("metadata")
+#         }
+
+#     except Exception as e:
+#         return {
+#             "is_extracted": False,
+#             "error": str(e),
+#             "metadata": {
+#                 "reference_id": reference_id,
+#                 "document_type": document_type,
+#             },
+#             # "output": None,
+#         }
+
+#### original code without insertion in attachment info table ####
+# async def run_mcp(reference_id, document_type, blob_url, blob_name):
+#     try:
+#         # 1. Resolve and ingest
+#         account, container, blob = resolve_blob(blob_url, blob_name)
+#         ingest(reference_id, account, container, blob)
+
+#         # 2. Run extraction
+#         extraction = await process_retrieval_pg(
+#             reference_id=reference_id,
+#             document_type=document_type,
+#         )
+
+#         # ✅ 3. DO NOT reshape — just return it
+#         return extraction
+
+#     except Exception as e:
+#         return {
+#             "extracted": False,
+#             "reference_id": reference_id,
+#             "document_type": document_type,
+#             "error_message": str(e),
+#         }
+
+# updated code with insertion in attachment info table
+async def run_mcp(reference_id, document_type, blob_url, blob_name):
+    try:
+        # 1. Resolve blob + ingest chunks
+        account, container, blob = resolve_blob(blob_url, blob_name)
+        ingest(reference_id, account, container, blob)
+
+        # ✅ 2. Store attachment metadata
+        insert_attachment_info(
+            reference_id=reference_id,
+            blob_url=blob_url,
+            document_type=document_type
+        )
+
+        # 3. Run extraction
+        extraction = await process_retrieval_pg(
+            reference_id=reference_id,
+            document_type=document_type,
+        )
+
+        return extraction
+
+    except Exception as e:
+        return {
+            "extracted": False,
+            "reference_id": reference_id,
+            "document_type": document_type,
+            "error_message": str(e),
+        }
+
